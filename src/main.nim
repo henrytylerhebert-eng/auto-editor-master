@@ -1,0 +1,465 @@
+import std/[options, os, parseutils, sequtils, strformat, strutils]
+when not defined(emscripten):
+  import std/[osproc, uri]
+  import cmds/completion
+when defined(emscripten):
+  {.emit: """
+extern int main(int argc, char** argv, char** env);
+int __main_argc_argv(int argc, char** argv) {
+  return main(argc, argv, (char**)0);
+}
+""".}
+when not defined(windows) and not defined(emscripten):
+  import std/posix_utils
+
+import ./[about, action, cli, conductor, edit, ffmpeg, log]
+import cmds/[info, desc, cache, levels, subdump, whisper]
+import util/[color, fun, term, rational]
+
+import vendor/tinyre/tinyre
+import vendor/libp2p/ed25519
+
+proc ctrlc() {.noconv.} =
+  error "Keyboard Interrupt"
+
+setControlCHook(ctrlc)
+
+when defined(debug) and not defined(emscripten) and not defined(windows):
+  import std/[posix, strutils]
+  proc sigsegvHandler(sig: cint) {.noconv.} =
+    writeStackTrace()
+    exitnow(1)
+  discard signal(SIGSEGV, sigsegvHandler)
+
+
+proc printHelp() {.noreturn.} =
+  let termWidth = max(terminalWidth(), 40)
+  let optWidth = min(32, termWidth div 3)
+  let helpWidth = termWidth - optWidth - 4
+
+  echo "Usage: [file | url ...] [options]\n"
+  echo "Commands:"
+  echo "  " & commands.mapIt(it.name).join(" ") & "\n"
+  echo "Options:"
+
+  var currentCat: Categories = cEdit
+  var first = true
+
+  for opt in mainOptions:
+    if opt.help == "":
+      continue
+
+    if opt.c != currentCat or first:
+      currentCat = opt.c
+      if first:
+        first = false
+      else:
+        echo ""
+      echo "  " & categoryName(currentCat) & ":"
+
+    var optStr = "    " & opt.names
+    if opt.metavar != "":
+      optStr &= " " & opt.metavar
+
+    if optStr.len >= optWidth:
+      echo optStr
+      let wrapped = wrapText(opt.help, helpWidth, 0)
+      for line in wrapped.split("\n"):
+        echo " ".repeat(optWidth) & line
+    else:
+      let padding = optWidth - optStr.len
+      let wrapped = wrapText(opt.help, helpWidth, optWidth)
+      let helpLines = wrapped.split("\n")
+      echo optStr & " ".repeat(padding) & helpLines[0]
+      for i in 1 ..< helpLines.len:
+        echo helpLines[i]
+
+  echo "\n    -h, --help" & " ".repeat(optWidth - 14) &
+    wrapText("Show info about this program then exit", helpWidth, optWidth)
+  echo ""
+  quit(0)
+
+proc parseTwoLengths(val, opt: string): (PackedInt, PackedInt) =
+  var vals = val.strip().split(",")
+  if vals.len == 1:
+    vals.add vals[0]
+  if vals.len != 2:
+    error &"--{opt} has too many arguments."
+  if "end" in vals:
+    error "Invalid number: 'end'"
+  if "start" in vals:
+    error "Invalid number: 'start'"
+  return (parseTime(vals[0]), parseTime(vals[1]))
+
+proc parseTimeRange(val, opt: string): (PackedInt, PackedInt) =
+  var vals = val.strip().split(",")
+  if vals.len < 2:
+    error &"--{opt} has too few arguments"
+  if vals.len > 2:
+    error &"--{opt} has too many arguments"
+  return (parseTime(vals[0]), parseTime(vals[1]))
+
+proc parseNum(val, opt: string): float64 =
+  let (num, unit) = splitNumStr(val)
+  if unit == "%":
+    result = num / 100.0
+  elif unit == "":
+    result = num
+  else:
+    error &"--{opt} has unknown unit: {unit}"
+
+proc parseResolution(val, opt: string): (int32, int32) =
+  let vals = val.strip().split(",")
+  if len(vals) != 2:
+    error &"'{val}': --{opt} takes two numbers"
+
+  var a, b: int
+  discard parseSaturatedNatural(vals[0], a)
+  discard parseSaturatedNatural(vals[1], b)
+  if a < 1 or b < 1:
+    error &"--{opt} must be positive"
+  if a > high(int32) or b > high(int32):
+    error &"--{opt} got an invalid/too high number"
+  return (a.int32, b.int32)
+
+proc parseSampleRate(val: string): cint =
+  let (num, unit) = splitNumStr(val)
+  if unit == "kHz" or unit == "KHz":
+    result = cint(num * 1000)
+  elif unit notin ["", "Hz"]:
+    error &"Unknown unit: '{unit}'"
+  else:
+    result = cint(num)
+  if result < 1:
+    error "Samplerate must be positive"
+
+proc parseFrameRate(val: string): AVRational =
+  if val == "ntsc":
+    return AVRational(num: 30000, den: 1001)
+  if val == "ntsc_film":
+    return AVRational(num: 24000, den: 1001)
+  if val == "pal":
+    return AVRational(num: 25, den: 1)
+  if val == "film":
+    return AVRational(num: 24, den: 1)
+  return AVRational(val)
+
+const PUBLIC_KEY_HEX = "aa8512235f1e329522c00b23e473a810a31ec8ee9c727cda91c779c9db6aae0f"
+
+proc validateKey(val: string): (bool, string) =
+  if val == "":
+    return (false, "")
+
+  let parts = val.split('.')
+  if parts.len != 2:
+    return (false, "bfmt")
+
+  let payloadBytes = b64urlDecode(parts[0])
+  let sigBytes = b64urlDecode(parts[1])
+
+  if sigBytes.len != EdSignatureSize:
+    return (false, "Bad signature length")
+
+  var pubKey: EdPublicKey
+  if not init(pubKey, PUBLIC_KEY_HEX):
+    return (false, "Failed to load public key")
+
+  var sig: EdSignature
+  if not init(sig, sigBytes):
+    return (false, "Bad signature length")
+
+  if verify(sig, payloadBytes, pubKey):
+    return (true, cast[string](payloadBytes))
+  return (false, "Incorrect key")
+
+
+when not defined(emscripten):
+  proc downloadVideo(myInput: string, args: mainArgs): string =
+    conwrite("Downloading video...")
+
+    proc getDomain(url: string): string =
+      let parsed = parseUri(url)
+      var hostname = parsed.hostname
+      if hostname.startsWith("www."):
+        hostname = hostname[4..^1]
+      return hostname
+
+    var downloadFormat = args.downloadFormat
+    if downloadFormat == "" and getDomain(myInput) == "youtube.com":
+      downloadFormat = "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+
+    var outputFormat: string
+    if args.outputFormat == "":
+      outputFormat = replace(splitext(myInput)[0], re"\W+", "-") & ".%(ext)s"
+    else:
+      outputFormat = args.outputFormat
+
+    var cmd: seq[string] = @[]
+    if downloadFormat != "":
+      cmd.add(@["-f", downloadFormat])
+
+    cmd.add(@["-o", outputFormat, myInput])
+    if args.yt_dlp_extras != "":
+      cmd.add(args.ytDlpExtras.split(" "))
+
+    let ytDlpPath = args.ytDlpLocation
+    var location: string
+    try:
+      location = execProcess(ytDlpPath,
+        args = @["--get-filename", "--no-warnings"] & cmd,
+        options = {poUsePath}).strip()
+    except OSError:
+      error "Program `yt-dlp` must be installed and on PATH."
+
+    if not fileExists(location):
+      let p = startProcess(ytDlpPath, args = cmd, options = {poUsePath, poParentStreams})
+      defer: p.close()
+      discard p.waitForExit()
+
+    if not fileExists(location):
+      error &"Download file wasn't created: {location}"
+
+    return location
+
+proc listAvailableFilters(): string =
+  result = "Filters:"
+  var opaque: pointer = nil
+  var filter: ptr AVFilter = av_filter_iterate(addr opaque)
+
+  while filter != nil:
+    if filter.name != nil:
+      result &= &" {filter.name}"
+    filter = av_filter_iterate(addr opaque)
+
+proc parseActions(val: string): Actions =
+  try:
+    var list: seq[Action]
+    for part in val.strip().split(","):
+      let trimmedPart = part.strip()
+      if trimmedPart == "nil": discard
+      elif trimmedPart == "cut": return aCut
+      elif trimmedPart == "invert": list.add Action(kind: actInvert)
+      elif trimmedPart == "hflip": list.add Action(kind: actHflip)
+      elif trimmedPart == "vflip": list.add Action(kind: actVflip)
+      elif trimmedPart.startsWith("speed:"):
+        try:
+          let value = parseFloat(trimmedPart[6 ..< trimmedPart.len])
+          list.add Action(kind: actSpeed, val: value)
+        except ValueError:
+          error &"Invalid speed value in action: {trimmedPart}"
+      elif trimmedPart.startsWith("varispeed:"):
+        try:
+          let value = parseFloat(trimmedPart[10 ..< trimmedPart.len])
+          list.add Action(kind: actVarispeed, val: value)
+        except ValueError:
+          error &"Invalid varispeed value in action: {trimmedPart}"
+      elif trimmedPart.startsWith("volume:"):
+        try:
+          let value = parseFloat(trimmedPart[7 ..< trimmedPart.len])
+          list.add Action(kind: actVolume, val: value)
+        except ValueError:
+          error &"Invalid volume value in action: {trimmedPart}"
+      elif trimmedPart.startsWith("zoom:"):
+        try:
+          let value = parseFloat(trimmedPart[5 ..< trimmedPart.len])
+          if value <= 0.0:
+            error "zoom value must be greater than 0.0"
+          list.add Action(kind: actZoom, val: value)
+        except ValueError:
+          error &"Invalid zoom value in action: {trimmedPart}"
+      else:
+        error &"Invalid action: {trimmedPart}"
+    return newActions(list)
+  except Exception as e:
+    error &"Error parsing actions '{val}': {e.msg}"
+
+proc parseSpeed(val, opt: string): float64 =
+  result = parseNum(val, opt)
+  if result <= 0.0 or result > 99999.0:
+    result = 99999.0
+
+proc actionFromUserSpeed(val: float64): Actions =
+  if val == 1.0: aNil
+  elif val <= 0.0 or val >= 99999.0: aCut
+  else: newActions([Action(kind: actSpeed, val: val)])
+
+proc parseSpeedRange(val: string): (Actions, PackedInt, PackedInt) =
+  let vals = val.strip().split(",")
+  if vals.len < 3:
+    error "--set-speed has too few arguments"
+  if vals.len > 3:
+    error "--set-speed has too many arguments"
+
+  let speed = parseSpeed(vals[0], "set-speed")
+  let action = actionFromUserSpeed(speed)
+  return (action, parseTime(vals[1]), parseTime(vals[2]))
+
+proc parseActionAndRange(val: string): (Actions, PackedInt, PackedInt) =
+  let parts = val.strip().split(",")
+  if parts.len < 3:
+    error "--set-action has too few arguments"
+  let actionStr = parts[0 ..< parts.len - 2].join(",")
+  let startTime = parseTime(parts[^2])
+  let endTime = parseTime(parts[^1])
+  return (parseActions(actionStr), startTime, endTime)
+
+proc main() =
+  if paramCount() < 1:
+    if stdin.isatty():
+      echo """Auto-Editor is an automatic video/audio creator and editor. By default, it
+will detect silence and create a new video with those sections cut out. By
+changing some of the options, you can export to a traditional editor like
+Premiere Pro and adjust the edits there, adjust the pacing of the cuts, and
+change the method of editing like using audio loudness and video motion to
+judge making cuts.
+"""
+      quit(0)
+  else:
+    genCmdCases(paramStr(1))
+
+  var args = mainArgs()
+  var showVersion: bool = false
+  var expecting: string = ""
+  var licenseKey: string
+
+  let cmdLineParams = commandLineParams()
+  for key in cmdLineParams:
+    if genCliMacro(key, args, mainOptions):
+      continue
+    if key in ["-h", "--help"]:
+      printHelp()
+    if key.startsWith("--"):
+      error &"Unknown option: {key}"
+    case expecting
+    of "":
+      args.inputs.add key
+    of "edit":
+      args.edit = key
+    of "export":
+      args.`export` = key
+    of "output":
+      args.output = key
+    of "when-silent":
+      args.whenSilent = parseActions(key)
+    of "when-normal":
+      args.whenNormal = parseActions(key)
+    of "silent-speed":
+      args.whenSilent = actionFromUserSpeed(parseSpeed(key, expecting))
+    of "video-speed":
+      args.whenNormal = actionFromUserSpeed(parseSpeed(key, expecting))
+    of "add-in":
+      block:
+        let span = parseTimeRange(key, expecting)
+        args.setAction.add (aNil, span[0], span[1])
+    of "cut-out":
+      block:
+        let span = parseTimeRange(key, expecting)
+        args.setAction.add (aCut, span[0], span[1])
+    of "set-speed":
+      args.setAction.add parseSpeedRange(key)
+    of "set-action":
+      args.setAction.add parseActionAndRange(key)
+    of "yt-dlp-location":
+      args.ytDlpLocation = key
+    of "download-format":
+      args.downloadFormat = key
+    of "output-format":
+      args.outputFormat = key
+    of "yt-dlp-extras":
+      args.ytDlpExtras = key
+    of "scale":
+      args.scale = parseNum(key, expecting)
+    of "resolution":
+      args.resolution = parseResolution(key, expecting)
+    of "background":
+      args.background = some(parseColor(key))
+    of "sample-rate":
+      args.sampleRate = parseSampleRate(key)
+    of "frame-rate":
+      args.frameRate = parseFrameRate(key)
+    of "vcodec":
+      args.videoCodec = key
+    of "video-bitrate":
+      args.videoBitrate = parseBitrate(key)
+    of "crf":
+      var val: int
+      discard parseSaturatedNatural(key, val)
+      if val >= 65: error "constant rate factor is too high: " & key
+      args.crf = val.int8
+    of "vprofile":
+      args.vprofile = key
+    of "preset":
+      args.preset = key
+    of "acodec":
+      args.audioCodec = key
+    of "layout":
+      args.audioLayout = key
+    of "audio-normalize":
+      args.audioNormalize = parseNorm(key)
+    of "audio-bitrate":
+      args.audioBitrate = parseBitrate(key)
+    of "progress":
+      try:
+        args.progress = parseEnum[BarType](key)
+      except ValueError:
+        error &"{key} is not a choice for --progress\nchoices are:\n  modern, classic, ascii, machine, none"
+    of "margin":
+      args.margin = parseTwoLengths(key, expecting)
+    of "smooth":
+      args.smooth = parseTwoLengths(key, expecting)
+    of "key":
+      licenseKey = key
+    of "tempdir":
+      tempDir = key
+    expecting = ""
+
+  if expecting != "":
+    error &"{cmdLineParams[^1]} needs argument."
+
+  if showVersion:
+    echo version
+    quit(0)
+
+  if args.inputs.len == 0 and isDebug:
+    echo "Auto-Editor: ", version
+    when defined(windows):
+      echo "OS: Windows ", when hostCPU == "amd64": "x86_64" else: hostCPU
+    elif defined(emscripten):
+      echo "OS: wasm32"
+    else:
+      let plat = uname()
+      echo "OS: ", plat.sysname, " ", plat.release, " ", plat.machine
+    echo listAvailableFilters()
+    quit(0)
+
+  if args.inputs.len > 1:
+    if licenseKey == "":
+      licenseKey = getEnv("AE_PRIVATE_LK", "")
+
+    let (isValid, reason) = validateKey(licenseKey)
+    if not isValid:
+      echo "inputs: [" & args.inputs.join(", ") & "]"
+      if reason == "":
+        error "You must provide a license key to enable using multiple inputs.\n(set a value to -k)"
+      elif reason == "bfmt":
+        error "License key is in a bad format.\nYou can get a key at https://app.auto-editor.com"
+      else:
+        error reason
+
+  for i, myInput in args.inputs:
+    if myInput.startsWith("http://") or myInput.startsWith("https://"):
+      when defined(emscripten):
+        error "URL inputs are not supported in the wasm build."
+      else:
+        args.inputs[i] = downloadVideo(myInput, args)
+    elif splitFile(myInput).ext == "":
+      if dirExists(myInput):
+        error "Input must be a file or a URL, not a directory."
+      if myInput.startsWith("-"):
+        error &"Option/Input file doesn't exist: {myInput}"
+      error &"Input file must have an extension: {myInput}"
+
+  editMedia(args)
+
+when isMainModule:
+  main()

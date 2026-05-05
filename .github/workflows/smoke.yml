@@ -1,0 +1,240 @@
+name: smoke
+permissions:
+  contents: read
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - '**.html'
+      - '**.css'
+      - '**.toml'
+      - '**about.nim'
+      - '.github/workflows/build.yml'
+    branches:
+      - master
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - '**.txt'
+      - '**.html'
+      - '**.css'
+      - '**.toml'
+      - '**about.nim'
+      - '.github/workflows/build.yml'
+    branches:
+      - master
+env:
+  AE_PRIVATE_LK: ${{ secrets.AE_PRIVATE_LK }}
+jobs:
+  fan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Cache tarballs
+        id: cache-tarballs
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg_sources
+          key: tarballs-${{ hashFiles('ae.nimble') }}
+      - name: Homebrew
+        if: steps.cache-tarballs.outputs.cache-hit != 'true'
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+      - name: Install packages
+        if: steps.cache-tarballs.outputs.cache-hit != 'true'
+        run: brew install nim
+      - name: Download
+        if: steps.cache-tarballs.outputs.cache-hit != 'true'
+        run: nimble downloaddeps
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: deps
+          path: ffmpeg_sources/*.tar.*
+          if-no-files-found: error
+  unixlike:
+    needs: fan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Get ffmpeg_sources
+        uses: actions/download-artifact@v8
+        with:
+          name: deps
+          path: ffmpeg_sources
+      - name: Install Homebrew
+        if: runner.os != 'macOS'
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+      - name: Install packages
+        run: brew install nim
+      - name: GCC/Clang version
+        run: nim --version && gcc --version
+      - name: Setup
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-24.04" ]; then
+            sudo apt-get install -y build-essential pkg-config nasm git
+          elif [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ]; then
+            sudo apt-get install -y build-essential pkg-config git
+          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+            echo "MACOSX_DEPLOYMENT_TARGET=14.0" >> $GITHUB_ENV
+          fi
+          echo "DISABLE_VPX=1" >> $GITHUB_ENV
+          echo "DISABLE_SVTAV1=1" >> $GITHUB_ENV
+          echo "DISABLE_HEVC=1" >> $GITHUB_ENV
+      - name: Build FFmpeg
+        run: nimble makeff
+      - name: Compile
+        run: nimble make
+      - name: Test
+        run: nimble test
+      - name: e2e Test
+        run: python3 -m pip install av && python3 tests/test.py
+
+  windows:
+    needs: fan
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Get ffmpeg_sources
+        uses: actions/download-artifact@v8
+        with:
+          name: deps
+          path: ffmpeg_sources
+      - name: Install Homebrew
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+      - name: Install nim
+        run: brew install nim
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get install -y mingw-w64 mingw-w64-tools mingw-w64-x86-64-dev
+          sudo apt-get install -y build-essential pkg-config nasm git meson
+          echo "DISABLE_VPX=1" >> $GITHUB_ENV
+          echo "DISABLE_SVTAV1=1" >> $GITHUB_ENV
+          echo "DISABLE_HEVC=1" >> $GITHUB_ENV
+      - name: Build FFmpeg
+        run: nimble makeffwin
+      - name: Compile
+        run: nimble windows
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: auto-editor-windows
+          path: |
+            auto-editor.exe
+            ffmpeg_sources/whisper/models/for-tests-ggml-tiny.bin
+
+  windows-test:
+    needs: windows
+    runs-on: windows-latest
+    env:
+      DISABLE_HEVC: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download auto-editor.exe
+        uses: actions/download-artifact@v8
+        with:
+          name: auto-editor-windows
+      - name: e2e Test
+        run: python -m pip install av && python tests/test.py
+
+  windows-arm:
+    needs: fan
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Get ffmpeg_sources
+        uses: actions/download-artifact@v8
+        with:
+          name: deps
+          path: ffmpeg_sources
+      - name: Install Homebrew
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+      - name: Install nim
+        run: brew install nim
+      - name: Install llvm-mingw
+        run: |
+          sudo apt-get install -y build-essential pkg-config git meson
+          curl -L -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260311/llvm-mingw-20260311-ucrt-ubuntu-22.04-aarch64.tar.xz
+          tar xf llvm-mingw.tar.xz
+          echo "$PWD/llvm-mingw-20260311-ucrt-ubuntu-22.04-aarch64/bin" >> $GITHUB_PATH
+          echo "DISABLE_VPX=1" >> $GITHUB_ENV
+          echo "DISABLE_SVTAV1=1" >> $GITHUB_ENV
+          echo "DISABLE_HEVC=1" >> $GITHUB_ENV
+      - name: Build FFmpeg
+        run: nimble makeffwinarm
+      - name: Compile
+        run: nimble windowsarm
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: auto-editor-windows-arm
+          path: |
+            auto-editor.exe
+            ffmpeg_sources/whisper/models/for-tests-ggml-tiny.bin
+
+  windows-arm-test:
+    needs: windows-arm
+    runs-on: windows-11-arm
+    env:
+      DISABLE_HEVC: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download auto-editor.exe
+        uses: actions/download-artifact@v8
+        with:
+          name: auto-editor-windows-arm
+      - name: e2e Test
+        run: python -m pip install av && python tests/test.py --no-failfast
+
+  wasm:
+    needs: fan
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Get ffmpeg_sources
+        uses: actions/download-artifact@v8
+        with:
+          name: deps
+          path: ffmpeg_sources
+      - name: Install packages
+        run: brew install nim emscripten wabt
+      - name: GCC/Clang version
+        run: nim --version && gcc --version
+      - name: Build FFmpeg
+        run: nimble makeffwasm
+      - name: Compile
+        run: nimble makewasm

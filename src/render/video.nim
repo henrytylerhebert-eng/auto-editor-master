@@ -1,0 +1,646 @@
+import std/[options, sets, strformat, tables]
+from std/math import round
+
+import ../[action, av, ffmpeg, graph, log, timeline]
+import ../util/[color, rational]
+
+# Helps with timing, may be extended.
+type VideoFrame = object
+  index: int
+  src: ptr string
+  effects: Actions
+
+# Keyframe index built from AVIndexEntry for efficient seeking
+type KeyframeIndex = object
+  frames: seq[int] # sorted list of keyframe frame numbers
+  avgInterval: int # average interval between keyframes (for seek decisions)
+  hasIndex: bool   # whether the demuxer provided index entries
+
+proc buildKeyframeIndex(stream: ptr AVStream, fps: AVRational, defaultInterval: int): KeyframeIndex =
+  ## Build a keyframe index from the stream's index entries.
+  result.frames = @[]
+  result.hasIndex = false
+  result.avgInterval = defaultInterval
+
+  let count = avformat_index_get_entries_count(stream)
+  if count <= 0:
+    return
+
+  result.hasIndex = true
+  let tb = stream.time_base
+
+  for i in 0 ..< count:
+    let entry = avformat_index_get_entry(stream, i)
+    if entry != nil and entry.isKeyframe:
+      let frameNum = int(round(float(entry.timestamp) * float(tb.num) / float(tb.den) * float(fps)))
+      result.frames.add(frameNum)
+
+  # Compute average interval from actual keyframes
+  if result.frames.len >= 2:
+    var total = 0
+    for i in 1 ..< result.frames.len:
+      total += result.frames[i] - result.frames[i - 1]
+    result.avgInterval = total div (result.frames.len - 1)
+
+proc findNearestKeyframeBefore(index: KeyframeIndex, targetFrame: int): int =
+  ## Find the nearest keyframe at or before targetFrame using binary search.
+  ## Returns -1 if no suitable keyframe found.
+  if index.frames.len == 0 or targetFrame < index.frames[0]:
+    return -1
+
+  var lo = 0
+  var hi = index.frames.len - 1
+
+  while lo < hi:
+    let mid = (lo + hi + 1) div 2
+    if index.frames[mid] <= targetFrame:
+      lo = mid
+    else:
+      hi = mid - 1
+
+  return index.frames[lo]
+
+func toInt(r: AVRational): int =
+  (r.num div r.den).int
+
+proc reformat*(frame: ptr AVFrame, format: AVPixelFormat, width: cint = 0,
+    height: cint = 0, ctx: ptr SwsContext = nil): ptr AVFrame =
+  if frame == nil:
+    return nil
+
+  let srcFormat = AVPixelFormat(frame.format)
+  let srcWidth = frame.width
+  let srcHeight = frame.height
+  let dstWidth = if width > 0: width else: srcWidth
+  let dstHeight = if height > 0: height else: srcHeight
+
+  # Shortcut: if format and dimensions are the same, return original frame
+  if srcFormat == format and srcWidth == dstWidth and srcHeight == dstHeight:
+    return frame
+
+  # Create new frame for output
+  let newFrame = av_frame_alloc()
+  if newFrame == nil:
+    error "Failed to allocate new frame"
+
+  newFrame.format = format.cint
+  newFrame.width = dstWidth
+  newFrame.height = dstHeight
+  newFrame.pts = frame.pts
+  newFrame.time_base = frame.time_base
+  newFrame.color_range = frame.color_range
+  newFrame.color_primaries = frame.color_primaries
+  newFrame.color_trc = frame.color_trc
+  newFrame.colorspace = frame.colorspace
+
+  var ret = av_frame_get_buffer(newFrame, 32)
+  if ret < 0:
+    error &"Failed to allocate buffer for new frame: {ret}"
+
+  var ownedCtx: ptr SwsContext = nil
+  let swsCtx = if ctx != nil:
+    ctx
+  else:
+    ownedCtx = sws_alloc_context()
+    if ownedCtx == nil:
+      error "Failed to allocate sws context"
+    ownedCtx
+
+  ret = sws_scale_frame(swsCtx, newFrame, frame)
+
+  if ownedCtx != nil:
+    sws_free_context(addr ownedCtx)
+
+  if ret < 0:
+    error "Failed to scale frame"
+
+  return newFrame
+
+proc makeSolid(width: cint, height: cint, color: RGBColor): ptr AVFrame =
+  let frame: ptr AVFrame = av_frame_alloc()
+  if frame == nil:
+    return nil
+
+  frame.format = AV_PIX_FMT_YUV420P.cint
+  frame.width = width
+  frame.height = height
+
+  if av_frame_get_buffer(frame, 32) < 0:
+    error "Bad buffer"
+
+  if av_frame_make_writable(frame) < 0:
+    error "Can't make frame writable"
+
+  # Fill Y plane (luma)
+  let yData: ptr uint8 = frame.data[0]
+  let yLinesize: cint = frame.linesize[0]
+  # Convert RGB to Y (luma): Y = 0.299*R + 0.587*G + 0.114*B
+  let yValue = uint8(0.299 * color.red.float + 0.587 * color.green.float + 0.114 *
+      color.blue.float)
+
+  for y in 0 ..< height:
+    let row: ptr uint8 = cast[ptr uint8](cast[int](yData) + y.int * yLinesize.int)
+    let rowArray = cast[ptr UncheckedArray[uint8]](row)
+    for x in 0 ..< width:
+      rowArray[x] = yValue
+
+  # Fill U plane (chroma)
+  let uData: ptr uint8 = frame.data[1]
+  let uLinesize: cint = frame.linesize[1]
+  # Convert RGB to U: U = -0.169*R - 0.331*G + 0.5*B + 128
+  let uValue = uint8(max(0.0, min(255.0, -0.169 * color.red.float - 0.331 *
+      color.green.float + 0.5 * color.blue.float + 128)))
+
+  for y in 0 ..< (height div 2):
+    let row: ptr uint8 = cast[ptr uint8](cast[int](uData) + y.int * uLinesize.int)
+    let rowArray = cast[ptr UncheckedArray[uint8]](row)
+    for x in 0 ..< (width div 2):
+      rowArray[x] = uValue
+
+  # Fill V plane (chroma)
+  let vData: ptr uint8 = frame.data[2]
+  let vLinesize: cint = frame.linesize[2]
+  # Convert RGB to V: V = 0.5*R - 0.419*G - 0.081*B + 128
+  let vValue = uint8(max(0.0, min(255.0, 0.5 * color.red.float - 0.419 *
+      color.green.float - 0.081 * color.blue.float + 128)))
+
+  for y in 0 ..< (height div 2):
+    let row: ptr uint8 = cast[ptr uint8](cast[int](vData) + y.int * vLinesize.int)
+    let rowArray = cast[ptr UncheckedArray[uint8]](row)
+    for x in 0 ..< (width div 2):
+      rowArray[x] = vValue
+
+  return frame
+
+proc scaleWithPad(src: ptr AVFrame, targetW, targetH: int32, bg: RGBColor): ptr AVFrame =
+  ## Scale src to fit within targetW x targetH preserving aspect ratio,
+  ## centering with bg color padding. Returns a new YUV420P frame.
+  ## Uses sws_scale_frame + manual pixel copy to avoid filter graph NEON
+  ## crashes on Windows ARM64.
+  let srcW = src.width
+  let srcH = src.height
+
+  # Compute fitted dims (equivalent to scale=force_original_aspect_ratio=decrease)
+  var scaledW = targetW
+  var scaledH = targetH
+  if srcW.int * targetH.int > srcH.int * targetW.int:
+    scaledH = cint((srcH.int * targetW.int) div srcW.int) and not 1.cint
+    if scaledH < 2: scaledH = 2
+  elif srcH.int * targetW.int > srcW.int * targetH.int:
+    scaledW = cint((srcW.int * targetH.int) div srcH.int) and not 1.cint
+    if scaledW < 2: scaledW = 2
+
+  # Create background frame (YUV420P, same as makeSolid output)
+  var output = makeSolid(targetW, targetH, bg)
+  if output == nil:
+    error "Could not create background frame in scaleWithPad"
+  output.pts = src.pts
+  output.time_base = src.time_base
+
+  # Scale + convert to YUV420P. Use a valid sws context but don't pre-allocate
+  # the destination buffer — sws_scale_frame calls av_frame_get_buffer itself
+  # when dst->data[0] is null, which avoids failures with unusual source frame
+  # layouts (e.g. dvvideo). A nil context is not safe in FFmpeg 8.1+.
+  var scaled = av_frame_alloc()
+  if scaled == nil:
+    av_frame_free(addr output)
+    error "Could not allocate scaled frame"
+  scaled.format = AV_PIX_FMT_YUV420P.cint
+  scaled.width = scaledW
+  scaled.height = scaledH
+  # Propagate interlaced flags so sws_frame_setup doesn't reject mismatched frames.
+  # AV_FRAME_FLAG_INTERLACED = 1<<3, AV_FRAME_FLAG_TOP_FIELD_FIRST = 1<<4
+  scaled.flags = src.flags and (8 or 16).cint
+  var swsCtx = sws_alloc_context()
+  if swsCtx == nil:
+    av_frame_free(addr scaled)
+    av_frame_free(addr output)
+    error "Could not allocate sws context in scaleWithPad"
+  let scaleRet = sws_scale_frame(swsCtx, scaled, src)
+  sws_free_context(addr swsCtx)
+  if scaleRet < 0:
+    av_frame_free(addr scaled)
+    av_frame_free(addr output)
+    error &"Could not scale frame in scaleWithPad: {scaleRet}"
+
+  # Even pixel offsets required for YUV420P chroma subsampling
+  let ox = ((targetW - scaledW) div 2) and not 1.cint
+  let oy = ((targetH - scaledH) div 2) and not 1.cint
+
+  # Copy Y plane
+  for y in 0 ..< scaled.height.int:
+    let sp = cast[pointer](cast[int](scaled.data[0]) + y * scaled.linesize[0].int)
+    let dp = cast[pointer](cast[int](output.data[0]) + (oy.int + y) * output.linesize[0].int + ox.int)
+    copyMem(dp, sp, scaled.width.int)
+
+  # Copy U plane (half dimensions for YUV420P)
+  for y in 0 ..< (scaled.height div 2).int:
+    let sp = cast[pointer](cast[int](scaled.data[1]) + y * scaled.linesize[1].int)
+    let dp = cast[pointer](cast[int](output.data[1]) + ((oy div 2).int + y) * output.linesize[1].int + (ox div 2).int)
+    copyMem(dp, sp, (scaled.width div 2).int)
+
+  # Copy V plane (half dimensions for YUV420P)
+  for y in 0 ..< (scaled.height div 2).int:
+    let sp = cast[pointer](cast[int](scaled.data[2]) + y * scaled.linesize[2].int)
+    let dp = cast[pointer](cast[int](output.data[2]) + ((oy div 2).int + y) * output.linesize[2].int + (ox div 2).int)
+    copyMem(dp, sp, (scaled.width div 2).int)
+
+  av_frame_free(addr scaled)
+  return output
+
+proc makeNewVideoFrames*(output: var OutputContainer, tl: v3, args: mainArgs,
+    cache: MediaCache = nil):
+    (ptr AVCodecContext, ptr AVStream, iterator(): (ptr AVFrame, int64)) =
+
+  let myCache = if cache != nil: cache else: newMediaCache()
+  var decoders = initTable[ptr string, ptr AVCodecContext]()
+  var tous = initTable[ptr string, int]()
+  var keyframeIndices = initTable[ptr string, KeyframeIndex]()
+
+  var pix_fmt = AV_PIX_FMT_YUV420P # Reasonable default
+  let targetFps = tl.tb # Always constant
+
+  var firstSrc: ptr string = nil
+  for src in tl.uniqueSources:
+    if firstSrc == nil:
+      firstSrc = src
+
+    if src notin myCache.cns:
+      myCache.cns[src] = av.open(src[])
+
+    let decoderCtx = initDecoder(myCache.cns[src].video[0].codecpar)
+    decoderCtx.thread_type = FF_THREAD_FRAME or FF_THREAD_SLICE
+    decoders[src] = decoderCtx
+
+  var targetWidth = tl.res[0]
+  var targetHeight = tl.res[1]
+  var scaleGraph: Graph = nil
+  var fxGraph: Graph = nil
+  var fxKey = ""
+  var needsScaling = false
+
+  if args.scale != 1.0:
+    targetWidth = max(int32(round(tl.res[0].float64 * args.scale)) and not 1'i32, 2)
+    targetHeight = max(int32(round(tl.res[1].float64 * args.scale)) and not 1'i32, 2)
+    needsScaling = true
+
+  debug &"Creating video stream with codec: {args.videoCodec}"
+  var (outputStream, encoderCtx) = output.addStream(args.videoCodec, targetFps,
+      lang = tl.langs[0], width = targetWidth, height = targetHeight)
+  let codec = encoderCtx.codec
+
+  if codec.id == ID_HEVC:
+    const codecTag = fourccToInt("hvc1") # for QuickTime
+    outputStream.codecpar.codec_tag = codecTag
+    encoderCtx.codec_tag = codecTag
+    discard av_opt_set(encoderCtx.priv_data, "x265-params", "log-level=error", 0)
+
+  encoderCtx.framerate = targetFps
+  encoderCtx.thread_type = FF_THREAD_FRAME or FF_THREAD_SLICE
+
+  let src = myCache.cns[firstSrc]
+  let color_range = src.video[0].codecpar.color_range
+  let colorspace = src.video[0].codecpar.color_space
+  let color_prim = src.video[0].codecpar.color_primaries
+  let color_trc = src.video[0].codecpar.color_trc
+
+  if color_range in [1, 2]:
+    encoderCtx.color_range = color_range
+  if colorspace in [0, 1] or (colorspace >= 3 and colorspace < 16):
+    encoderCtx.colorspace = colorspace
+  if color_prim == 1 or (color_prim >= 4 and color_prim < 17):
+    encoderCtx.color_primaries = color_prim
+  if color_trc == 1 or (color_trc >= 4 and color_trc < 22):
+    encoderCtx.color_trc = color_trc
+
+  if args.videoBitrate >= 0:
+    encoderCtx.bit_rate = args.videoBitrate
+    debug(&"video bitrate: {encoderCtx.bit_rate}")
+  else:
+    debug(&"[auto] video bitrate: {encoderCtx.bit_rate}")
+
+  let sar = src.video[0].codecpar.sample_aspect_ratio
+  if sar != 0:
+    encoderCtx.sample_aspect_ratio = sar
+
+  for src, cn in myCache.cns:
+    if len(cn.video) > 0:
+      let stream = cn.video[0]
+      let defaultInterval = toInt(targetFps * AVRational(num: 5, den: 1))
+      if args.noSeek:
+        tous[src] = 1000
+        keyframeIndices[src] = KeyframeIndex(frames: @[], hasIndex: false, avgInterval: high(int))
+      else:
+        tous[src] = int(float(stream.time_base.den) / float(stream.avg_frame_rate))
+        keyframeIndices[src] = buildKeyframeIndex(stream, stream.avg_frame_rate, defaultInterval)
+
+        let kfIndex = keyframeIndices[src]
+        if kfIndex.hasIndex:
+          debug &"Source {src[]}: {kfIndex.frames.len} keyframes indexed, avg interval: {kfIndex.avgInterval} frames"
+        else:
+          debug &"Source {src[]}: no index entries, using estimated interval: {kfIndex.avgInterval} frames"
+
+      if src == firstSrc and encoderCtx.pix_fmt != AV_PIX_FMT_NONE:
+        pix_fmt = AVPixelFormat(cn.video[0].codecpar.format)
+
+  var needValidFmt = true
+  if codec.pix_fmts != nil:
+    var i = 0
+    while codec.pix_fmts[i].cint != -1:
+      if pix_fmt == codec.pix_fmts[i]:
+        needValidFmt = false
+        break
+      i += 1
+
+  if needValidFmt:
+    if codec.pix_fmts != nil:
+      let best = avcodec_find_best_pix_fmt_of_list(codec.pix_fmts, pix_fmt, 0, nil)
+      pix_fmt = if best != AV_PIX_FMT_NONE: best else: AV_PIX_FMT_YUV420P
+    else:
+      pix_fmt = AV_PIX_FMT_YUV420P
+
+  if args.vprofile != "":
+    encoderCtx.setProfileOrErr(args.vprofile)
+
+  if args.crf >= 0:
+    discard av_opt_set_int(encoderCtx.priv_data, "crf", args.crf.cint, 0)
+  if args.preset != "":
+    discard av_opt_set(encoderCtx.priv_data, "preset", cstring(args.preset), 0)
+
+  encoderCtx.pix_fmt = pix_fmt
+  encoderCtx.open()
+  pix_fmt = encoderCtx.pix_fmt
+  if avcodec_parameters_from_context(outputStream.codecpar, encoderCtx) < 0:
+    error "Could not copy encoder parameters to stream"
+
+  let pixFmtName = $pix_fmt
+  let graphTb = av_inv_q(targetFps)
+  let bg = tl.bg.toString
+
+  if needsScaling:
+    let bufferArgs = &"video_size={tl.res[0]}x{tl.res[1]}:pix_fmt={pixFmtName}:time_base={graphTb}:pixel_aspect=1/1"
+
+    scaleGraph = newGraph()
+    let bufferSrc = scaleGraph.add("buffer", bufferArgs)
+    let scaleFilter = scaleGraph.add("scale", &"{targetWidth}:{targetHeight}")
+    let bufferSink = scaleGraph.add("buffersink")
+
+    scaleGraph.linkNodes(@[bufferSrc, scaleFilter, bufferSink]).configure()
+
+  # Create a persistent sws context for the per-frame pixel format conversion.
+  # Reusing it avoids the per-frame alloc/init overhead of the new sws API.
+  var reformatCtx: ptr SwsContext = nil
+  if pix_fmt != AVPixelFormat(src.video[0].codecpar.format):
+    reformatCtx = sws_alloc_context()
+    if reformatCtx == nil:
+      error "Failed to allocate reformat sws context"
+    discard av_opt_set_int(reformatCtx, "threads", 0, 0)
+
+  # First few frames can have an abnormal keyframe count, so never seek there.
+  var seekThreshold = 10
+  var seekFrame = none(int)
+  var framesSaved = 0
+
+  var nullFrame = makeSolid(targetWidth, targetHeight, tl.bg)
+  var frameIndex = -1
+  var frame: ptr AVFrame = av_frame_clone(nullFrame)
+  var objList: seq[VideoFrame] = @[]
+  var lastProcessedFrame: ptr AVFrame = nil
+  var lastFrameIndex = -1
+  var lastKeyframePos = initTable[ptr string, int]()
+  var lastSeekTarget = initTable[ptr string, int]()
+  let isNonlinear = tl.isNonlinear
+
+  debug &"isNonlinear: {isNonlinear}"
+
+  # Initialize lastKeyframePos to 0 for all sources (frame 0 is always seekable)
+  for src in tl.uniqueSources:
+    lastKeyframePos[src] = 0
+    lastSeekTarget[src] = -1 # -1 means no seek has been performed yet
+
+  # Helper to find best keyframe for backward seeking
+  proc findBestKeyframe(src: ptr string, targetFrame: int): int =
+    let kfIndex = keyframeIndices[src]
+    if kfIndex.hasIndex and kfIndex.frames.len > 0:
+      let kf = findNearestKeyframeBefore(kfIndex, targetFrame)
+      if kf >= 0:
+        return kf
+    let fallback = lastKeyframePos[src]
+    if fallback <= targetFrame:
+      return fallback
+    return 0 # frame 0 is always seekable
+
+  return (encoderCtx, outputStream, iterator(): (ptr AVFrame, int64) =
+    # Process each frame in timeline order like Python version
+    for index in 0 ..< tl.len:
+      objList = @[]
+
+      for layer in tl.v:
+        for obj in layer:
+          if index >= obj.start and index < (obj.start + obj.dur):
+            # Convert timeline position from target framerate to source framerate
+            let timelinePos = obj.offset + index - obj.start
+            let srcStream = myCache.cns[obj.src].video[0]
+            let srcTb = srcStream.avg_frame_rate
+            let sourceFramePos = int(round(float(timelinePos) * srcTb.float / tl.tb.float))
+            let effectGroup = tl.effects[obj.effects]
+            var speed = 1.0
+            for effect in effectGroup:
+              if effect.kind in [actSpeed, actVarispeed]:
+                speed *= effect.val
+
+            let i = int(round(float(sourceFramePos) * speed))
+            objList.add VideoFrame(index: i, src: obj.src, effects: effectGroup)
+
+      if isNonlinear:
+        # When there can be valid gaps in the timeline and no objects for this frame.
+        frame = av_frame_clone(nullFrame)
+      else:
+        # Always start with a fresh frame to avoid reusing encoder-unref'd frames
+        let oldFrame = frame
+        if pix_fmt == AV_PIX_FMT_RGB8 and lastProcessedFrame != nil:
+          frame = av_frame_clone(lastProcessedFrame)
+        else:
+          frame = av_frame_clone(nullFrame)
+        if oldFrame != nil and oldFrame != nullFrame:
+          av_frame_free(addr oldFrame)
+
+      for obj in objList:
+        # Check if we can reuse the last processed frame
+        if obj.index == lastFrameIndex and lastProcessedFrame != nil:
+          frame = av_frame_clone(lastProcessedFrame)
+          continue
+
+        var myStream: ptr AVStream = myCache.cns[obj.src].video[0]
+        if frameIndex > obj.index:
+          let seekTarget = findBestKeyframe(obj.src, obj.index)
+
+          if seekTarget < 0 or seekTarget > obj.index:
+            let kfIndex = keyframeIndices[obj.src]
+            let indexInfo = if kfIndex.hasIndex: &"{kfIndex.frames.len} indexed" else: "no index"
+            error &"Cannot seek backward: no suitable keyframe found (frameIndex: {frameIndex}, target: {obj.index}, seekTarget: {seekTarget}, {indexInfo})"
+
+          if lastSeekTarget[obj.src] != seekTarget:
+            debug &"Seek backward: from {frameIndex} to keyframe {seekTarget} (need frame {obj.index})"
+            myCache.cns[obj.src].seek(seekTarget * tous[obj.src], stream = myStream)
+            avcodec_flush_buffers(decoders[obj.src])
+            lastSeekTarget[obj.src] = seekTarget
+          # Use min to ensure the decode loop runs even when seekTarget == obj.index
+          frameIndex = min(seekTarget, obj.index - 1)
+
+        # obj.index is already in source frame coordinates, no conversion needed
+        let srcTb = myStream.avg_frame_rate
+
+        while frameIndex < obj.index:
+          # Check if skipping ahead is worth it
+          if obj.index - frameIndex > keyframeIndices[obj.src].avgInterval and frameIndex > seekThreshold:
+            if lastSeekTarget[obj.src] != obj.index:
+              seekThreshold = frameIndex + (keyframeIndices[obj.src].avgInterval div 2)
+              seekFrame = some(frameIndex)
+
+              debug &"Seek: {frameIndex} -> {obj.index}"
+              myCache.cns[obj.src].seek(obj.index * tous[obj.src], stream = myStream)
+              avcodec_flush_buffers(decoders[obj.src])
+              lastSeekTarget[obj.src] = obj.index
+
+          let decoder: ptr AVCodecContext = decoders[obj.src]
+          var foundFrame = false
+          for decodedFrame in myCache.cns[obj.src].flushDecode(myStream.index.cint, decoder, frame):
+            frame = decodedFrame
+            frameIndex = int(round(decodedFrame.time(myStream.time_base) * srcTb.float))
+
+            # Track keyframe positions for smarter backward seeking
+            # Only track I-frames that are at or before our target to avoid overshooting
+            if decodedFrame.pict_type == AV_PICTURE_TYPE_I and frameIndex <= obj.index:
+              lastKeyframePos[obj.src] = frameIndex
+
+            foundFrame = true
+            break
+
+          if not foundFrame:
+            frame = av_frame_clone(nullFrame)
+            break
+
+          if seekFrame.isSome:
+            let framesAvoided = frameIndex - seekFrame.get
+            debug &"Seek landed at frame {frameIndex}, avoided decoding {framesAvoided} frames"
+            framesSaved += framesAvoided
+            seekFrame = none(int)
+
+          if (frame.width.int32, frame.height.int32) != tl.res:
+            let oldFrame = frame
+            frame = scaleWithPad(frame, tl.res[0], tl.res[1], tl.bg)
+            if oldFrame != nil and oldFrame != nullFrame:
+              av_frame_free(addr oldFrame)
+
+      if scaleGraph != nil and frame.width != targetWidth:
+        scaleGraph.push(frame)
+        let oldFrame = frame
+        frame = scaleGraph.pull()
+        if oldFrame != nil and oldFrame != nullFrame:
+          av_frame_free(addr oldFrame)
+
+      # Apply video effects in order
+      if objList.len > 0 and frame != nil and frame.width > 0 and frame.height > 0:
+        for effect in objList[0].effects:
+          if effect.kind == actZoom and effect.val != 1.0:
+            let origW = frame.width
+            let origH = frame.height
+            let scaledW = max(cint(float(origW) * effect.val), 2)
+            let scaledH = max(cint(float(origH) * effect.val), 2)
+            let scaledFrame = frame.reformat(AVPixelFormat(frame.format), scaledW, scaledH)
+            if scaledFrame != frame:
+              let oldFrame = frame
+              frame = scaledFrame
+              if oldFrame != nil and oldFrame != nullFrame:
+                av_frame_free(addr oldFrame)
+            let frameFmtName = $AVPixelFormat(frame.format)
+            let zoomBufArgs = &"video_size={scaledW}x{scaledH}:pix_fmt={frameFmtName}:time_base={graphTb}:pixel_aspect=1/1"
+            let zoomMode = if effect.val > 1.0: "crop" else: "pad"
+            let key = &"zoom|{zoomMode}|{origW}x{origH}|{bg}|{zoomBufArgs}"
+            if fxKey != key:
+              if fxGraph != nil:
+                fxGraph.cleanup()
+              fxGraph = newGraph()
+              let bufferSrc = fxGraph.add("buffer", zoomBufArgs)
+              let mid = if effect.val > 1.0:
+                  fxGraph.add("crop", &"{origW}:{origH}")
+                else:
+                  fxGraph.add("pad", &"{origW}:{origH}:-1:-1:color={bg}")
+              let bufferSink = fxGraph.add("buffersink")
+              fxGraph.linkNodes(@[bufferSrc, mid, bufferSink]).configure()
+              fxKey = key
+            fxGraph.push(frame)
+            let oldFrame2 = frame
+            frame = fxGraph.pull()
+            if oldFrame2 != nil and oldFrame2 != nullFrame:
+              av_frame_free(addr oldFrame2)
+          elif effect.kind in {actHflip, actVflip, actInvert}:
+            let filterName = case effect.kind
+              of actHflip: "hflip"
+              of actVflip: "vflip"
+              else: "negate"
+            let frameFmtName = $AVPixelFormat(frame.format)
+            let bufferArgs = &"video_size={frame.width}x{frame.height}:pix_fmt={frameFmtName}:time_base={graphTb}:pixel_aspect=1/1"
+            let key = filterName & "|" & bufferArgs
+            if fxKey != key:
+              if fxGraph != nil:
+                fxGraph.cleanup()
+              fxGraph = newGraph()
+              let bufferSrc = fxGraph.add("buffer", bufferArgs)
+              let filt = fxGraph.add(filterName)
+              let bufferSink = fxGraph.add("buffersink")
+              fxGraph.linkNodes(@[bufferSrc, filt, bufferSink]).configure()
+              fxKey = key
+            fxGraph.push(frame)
+            let oldFrame = frame
+            frame = fxGraph.pull()
+            if oldFrame != nil and oldFrame != nullFrame:
+              av_frame_free(addr oldFrame)
+
+      # Validate frame before reformatting
+      if frame != nil and (frame.width <= 0 or frame.height <= 0):
+        debug &"Warning: Invalid frame at {index}tb, using fallback"
+        av_frame_free(addr frame)
+        if lastProcessedFrame != nil:
+          frame = av_frame_clone(lastProcessedFrame)
+          if frame == nil:
+            frame = av_frame_clone(nullFrame)
+        else:
+          frame = av_frame_clone(nullFrame)
+        if frame == nil:
+          error &"Failed to create fallback frame at {index}tb"
+
+      let reformattedFrame = frame.reformat(pix_fmt, ctx = reformatCtx)
+      if reformattedFrame != nil and reformattedFrame != frame:
+        let oldFrame = frame
+        frame = reformattedFrame
+        if oldFrame != nil and oldFrame != nullFrame:
+          av_frame_free(addr oldFrame)
+
+      frame.pts = index.int64
+      frame.time_base = av_inv_q(tl.tb)
+      frame.duration = index.int64
+
+      # Update cache for frame reuse BEFORE yielding (which will unref the frame)
+      if objList.len > 0:
+        if lastProcessedFrame != nil and lastProcessedFrame != nullFrame:
+          av_frame_free(addr lastProcessedFrame)
+        lastProcessedFrame = av_frame_clone(frame)
+        lastFrameIndex = objList[0].index
+
+      yield (frame, index)
+
+    if scaleGraph != nil:
+      scaleGraph.cleanup()
+    if fxGraph != nil:
+      fxGraph.cleanup()
+    if reformatCtx != nil:
+      sws_free_context(addr reformatCtx)
+    if lastProcessedFrame != nil and lastProcessedFrame != nullFrame:
+      av_frame_free(addr lastProcessedFrame)
+    av_frame_free(addr nullFrame)
+    for src, decoder in decoders:
+      var p = decoder
+      avcodec_free_context(addr p)
+    debug &"Total frames avoided decoding via seeks: {framesSaved}")

@@ -1,0 +1,288 @@
+import std/[json, strformat, strutils]
+
+import ../[av, ffmpeg, log, media, timeline]
+import ../util/[fun, lang, rational]
+
+proc genericTrack(lang: Lang, bitrate: int64) =
+  if bitrate != 0:
+    echo &"     - bitrate: {bitrate}"
+  if lang != ['u', 'n', 'd', '\0']:
+    echo &"     - lang: {lang}"
+
+func bt709(val: int): string =
+  if val == 1:
+    return "1 (bt709)"
+  return $val
+
+func fourccToString(fourcc: uint32): string =
+  var buf: array[5, char]
+  buf[0] = char(fourcc and 0xFF)
+  buf[1] = char((fourcc shr 8) and 0xFF)
+  buf[2] = char((fourcc shr 16) and 0xFF)
+  buf[3] = char((fourcc shr 24) and 0xFF)
+  buf[4] = '\0'
+  return $cast[cstring](addr buf[0])
+
+proc printYamlInfo(fileInfo: MediaInfo) =
+  var tb = AVRational(30)
+  if fileInfo.v.len > 0:
+    tb = makeSaneTimebase(fileInfo.v[0].avg_rate)
+  echo &"{fileInfo.path}:\n - recommendedTimebase: {tb.num}/{tb.den}"
+
+  if fileInfo.v.len > 0:
+    echo " - video:"
+  for track, v in fileInfo.v:
+    let (ratioWidth, ratioHeight) = aspectRatio(v.width, v.height)
+
+    echo &"   - track {track}:"
+    echo &"     - codec: {$avcodec_get_name(v.codecId)}"
+    echo &"     - fps: {v.avg_rate}"
+    echo &"     - resolution: {v.width}x{v.height}"
+    echo &"     - aspect ratio: {ratioWidth}:{ratioHeight}"
+    echo &"     - pixel aspect ratio: {v.sar}"
+    if v.duration != 0.0:
+      echo &"     - duration: {v.duration}"
+    echo &"     - pix fmt: {v.pix_fmt}"
+
+    if v.color_range == 1:
+      echo "     - color range: 1 (tv)"
+    elif v.color_range == 2:
+      echo "     - color range: 2 (pc)"
+    elif v.color_range != 0:
+      echo &"     - color range: {v.color_range}"
+
+    if v.color_space != 2:
+      echo &"     - color space: {v.color_space.bt709}"
+    if v.color_primaries != 2:
+      echo &"     - color primaries: {v.color_primaries.bt709}"
+    if v.color_transfer != 2:
+      echo &"     - color transfer: {v.color_transfer.bt709}"
+    echo &"     - timebase: {v.timebase}"
+    genericTrack(v.lang, v.bitrate)
+
+
+  if fileInfo.a.len > 0:
+    echo " - audio:"
+  for track, a in fileInfo.a:
+    echo &"   - track {track}:"
+    echo &"     - codec: {$avcodec_get_name(a.codecId)}"
+    echo &"     - layout: {a.layout}"
+    echo &"     - samplerate: {a.samplerate}"
+    if a.duration != 0.0:
+      echo &"     - duration: {a.duration}"
+    genericTrack(a.lang, a.bitrate)
+
+  if fileInfo.s.len > 0:
+    echo " - subtitle:"
+  for track, s in fileInfo.s:
+    echo &"   - track {track}:"
+    echo &"     - codec: {$avcodec_get_name(s.codecId)}"
+    genericTrack(s.lang, 0)
+
+  if fileInfo.d.len > 0:
+    echo " - data:"
+  for track, d in fileInfo.d:
+    echo &"   - track {track}:"
+    echo &"     - codec: {$avcodec_get_name(d.codecId)} ({fourccToString(d.tag)})"
+    echo &"     - timecode: {d.timecode}"
+
+  if fileInfo.i.len > 0:
+    echo " - image:"
+  for track, i in fileInfo.i:
+    let (ratioWidth, ratioHeight) = aspectRatio(i.width, i.height)
+
+    echo &"   - track {track}:"
+    echo &"     - codec: {$avcodec_get_name(i.codecId)}"
+    echo &"     - resolution: {i.width}x{i.height}"
+    echo &"     - aspect ratio: {ratioWidth}:{ratioHeight}"
+    echo &"     - pixel aspect ratio: {i.sar}"
+    echo &"     - pix fmt: {i.pix_fmt}"
+
+    if i.color_range == 1:
+      echo "     - color range: 1 (tv)"
+    elif i.color_range == 2:
+      echo "     - color range: 2 (pc)"
+    elif i.color_range != 0:
+      echo &"     - color range: {i.color_range}"
+
+    if i.color_space != 2:
+      echo &"     - color space: {i.color_space.bt709}"
+    if i.color_primaries != 2:
+      echo &"     - color primaries: {i.color_primaries.bt709}"
+    if i.color_transfer != 2:
+      echo &"     - color transfer: {i.color_transfer.bt709}"
+    genericTrack(i.lang, i.bitrate)
+
+  echo " - container:"
+  if fileInfo.duration != 0.0:
+    echo &"   - duration: {fileInfo.duration}"
+  echo &"   - bitrate: {fileInfo.bitrate}"
+
+
+func getJsonInfo(fileInfo: MediaInfo): JsonNode =
+  var varr, aarr, sarr, iarr: seq[JsonNode] = @[]
+  var tb = AVRational(30)
+  if fileInfo.v.len > 0:
+    tb = makeSaneTimebase(fileInfo.v[0].avg_rate)
+
+  for v in fileInfo.v:
+    let (ratioWidth, ratioHeight) = aspectRatio(v.width, v.height)
+    varr.add( %* {
+      "codec": $avcodec_get_name(v.codecId),
+      "fps": $v.avg_rate,
+      "resolution": [v.width, v.height],
+      "aspect_ratio": [ratioWidth, ratioHeight],
+      "pixel_aspect_ratio": $v.sar,
+      "duration": v.duration,
+      "pix_fmt": $v.pix_fmt,
+      "color_range": v.color_range,
+      "color_space": v.color_space,
+      "color_primaries": v.color_primaries,
+      "color_transfer": v.color_transfer,
+      "timebase": $v.timebase,
+      "bitrate": v.bitrate,
+      "lang": v.lang
+    })
+
+  for a in fileInfo.a:
+    aarr.add( %* {"codec": $avcodec_get_name(a.codecId), "layout": a.layout,
+        "samplerate": a.sampleRate, "duration": a.duration,
+        "bitrate": a.bitrate, "lang": a.lang})
+
+  for s in fileInfo.s:
+    sarr.add( %* s)
+
+  for i in fileInfo.i:
+    let (ratioWidth, ratioHeight) = aspectRatio(i.width, i.height)
+    iarr.add( %* {
+      "codec": $avcodec_get_name(i.codecId),
+      "resolution": [i.width, i.height],
+      "aspect_ratio": [ratioWidth, ratioHeight],
+      "pixel_aspect_ratio": $i.sar,
+      "pix_fmt": $i.pix_fmt,
+      "color_range": i.color_range,
+      "color_space": i.color_space,
+      "color_primaries": i.color_primaries,
+      "color_transfer": i.color_transfer,
+      "lang": i.lang
+    })
+
+  result = %* {
+    "type": "media",
+    "recommendedTimebase": $tb.num & "/" & $tb.den,
+    "video": varr,
+    "audio": aarr,
+    "subtitle": sarr,
+    "image": iarr,
+    "container": {
+      "duration": fileInfo.duration,
+      "bitrate": fileInfo.bitrate
+    }
+  }
+
+
+proc printEncoders(fmtName: string) =
+  let fakeName = "output." & fmtName
+  let ofmt = av_guess_format(nil, fakeName.cstring, nil)
+  if ofmt == nil:
+    error &"Unknown format: {fmtName}"
+
+  var videos, audios, subs, others: seq[string]
+  var opaque: pointer = nil
+  while true:
+    let codec = av_codec_iterate(addr opaque)
+    if codec == nil: break
+    if av_codec_is_encoder(codec) == 0: continue
+    if avformat_query_codec(ofmt, codec.id, FF_COMPLIANCE_STRICT) > 0:
+      case codec.`type`
+      of AVMEDIA_TYPE_VIDEO: videos.add $codec.name
+      of AVMEDIA_TYPE_AUDIO: audios.add $codec.name
+      of AVMEDIA_TYPE_SUBTITLE: subs.add $codec.name
+      else: others.add $codec.name
+
+  echo "v: " & videos.join(",")
+  echo "a: " & audios.join(",")
+  echo "s: " & subs.join(",")
+  echo "other: " & others.join(",")
+
+proc printDecoders(fmtName: string) =
+  let fakeName = "output." & fmtName
+  let ofmt = av_guess_format(nil, fakeName.cstring, nil)
+  if ofmt == nil:
+    error &"Unknown format: {fmtName}"
+
+  var videos, audios, subs, others: seq[string]
+  var opaque: pointer = nil
+  while true:
+    let codec = av_codec_iterate(addr opaque)
+    if codec == nil: break
+    if av_codec_is_decoder(codec) == 0: continue
+    if avformat_query_codec(ofmt, codec.id, FF_COMPLIANCE_STRICT) > 0:
+      case codec.`type`
+      of AVMEDIA_TYPE_VIDEO: videos.add $codec.name
+      of AVMEDIA_TYPE_AUDIO: audios.add $codec.name
+      of AVMEDIA_TYPE_SUBTITLE: subs.add $codec.name
+      else: others.add $codec.name
+
+  echo "v: " & videos.join(",")
+  echo "a: " & audios.join(",")
+  echo "s: " & subs.join(",")
+  echo "other: " & others.join(",")
+
+proc main*(args: seq[string]) =
+  av_log_set_level(AV_LOG_QUIET)
+
+  var isJson = false
+  var encodersFmt = ""
+  var decodersFmt = ""
+  var inputFiles: seq[string] = @[]
+
+  var i = 0
+  while i < args.len:
+    let key = args[i]
+    if key == "--json":
+      isJson = true
+    elif key == "-encoders":
+      inc i
+      if i >= args.len:
+        error "-encoders requires a format argument"
+      encodersFmt = args[i]
+    elif key == "-decoders":
+      inc i
+      if i >= args.len:
+        error "-decoders requires a format argument"
+      decodersFmt = args[i]
+    else:
+      if key.startsWith("--"):
+        error &"Unknown option: {key}"
+      inputFiles.add key
+    inc i
+
+  if encodersFmt != "":
+    printEncoders(encodersFmt)
+    return
+
+  if decodersFmt != "":
+    printDecoders(decodersFmt)
+    return
+
+  var fileInfo: JsonNode = %* {}
+  for inputFile in inputFiles:
+    try:
+      let formatCtx = av.openFormatCtx(inputFile.cstring)
+      let mediaInfo = initMediaInfo(formatCtx, inputFile)
+      avformat_close_input(addr formatCtx)
+
+      if isJson:
+        fileInfo[inputFile] = getJsonInfo(mediaInfo)
+      else:
+        printYamlInfo(mediaInfo)
+        echo ""
+    except IOError:
+      if isJson:
+        fileInfo[inputFile] = %* {"type": "invalid"}
+      else:
+        echo inputFile & "\n - Invalid\n"
+
+  if isJson:
+    echo pretty(fileInfo)

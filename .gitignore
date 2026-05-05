@@ -1,0 +1,33 @@
+auto-editor
+build
+build_*
+ffmpeg_sources
+.vscode
+*.bin
+*.onnx
+tests/*
+!tests/*.nim
+!tests/*.py
+*_ALTERED*
+*https*
+*.v3
+*.srt
+
+# OS Files
+.DS_Store
+*.dylib
+*.o
+
+# Generated Files
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+*.egg-info/
+nimble.develop
+nimble.paths
+nimbledeps
+
+# Wasm Files
+*\.wasm
+*-web\.js
