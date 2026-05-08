@@ -75,6 +75,6 @@ proc newActions*(list: openArray[Action]): Actions =
 func `$`*(a: Actions): string =
   if a.isCut: return "cut"
   if a.isEmpty: return "nil"
-  var parts: seq[string]
+  var parts = newSeqOfCap[string](a.len)
   for action in a: parts.add $action
   parts.join(",")
