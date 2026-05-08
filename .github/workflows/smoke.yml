@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@v6
       - name: Conflict Marker Scan
         run: |
-          if grep -R "<<<<<<<\|=======\|>>>>>>>" -n . --exclude-dir=.git --exclude-dir=ffmpeg_sources --exclude-dir=build; then echo "Found conflict markers"; /usr/bin/false; fi
+          if grep -R "^<<<<<<<\|^=======\|^>>>>>>>" -n . --exclude-dir=.git --exclude-dir=ffmpeg_sources --exclude-dir=build; then echo "Found conflict markers"; /usr/bin/false; fi
       - name: Check Ignored Artifacts
         run: |
           IGNORED=$(git ls-files -i -c --exclude-standard)
