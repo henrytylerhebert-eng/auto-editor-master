@@ -452,19 +452,10 @@ proc close*(self: OutputContainer) =
 
 
 func name*(stream: ptr AVStream): string =
-  if stream == nil or stream.codecpar == nil:
+  if stream == nil or stream.codecpar == nil or stream.codecpar.codec_id == ID_NONE:
     return ""
 
-  let codec = avcodec_find_decoder(stream.codecpar.codec_id)
-  if codec != nil and codec.name != nil:
-    return $codec.name
-
-  # Fallback to codec descriptor if codec not found
-  # let desc = avcodec_descriptor_get(stream.codecpar.codec_id)
-  # if desc != nil and desc.name != nil:
-  #   return $desc.name
-
-  return ""
+  return $avcodec_get_name(stream.codecpar.codec_id)
 
 proc initLayout*(layout: string): ref AVChannelLayout =
   if layout == "":
