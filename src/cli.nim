@@ -97,13 +97,12 @@ Actions available:
   OptDef(names: "-m, --margin", c: cEdit, datum: "margin", metavar: "LENGTH[,LENGTH?]",
       help: """
 Set sections near "loud" as "loud" too if section is less than LENGTH away. (default is "0.2s")"""),
-  OptDef(names: "--smooth", c: cEdit, datum: "smooth", metavar: "MINCUT[,MINCLIP?]",
+  OptDef(names: "-s, --smooth", c: cEdit, datum: "smooth", metavar: "MINCUT[,MINCLIP?]",
       help: """
 Make sections 'smoother' by applying minimum cut and minimum clip rules. (default is 0.2s,0.1s)
 Examples:
-  --smooth 0.2s,0.1s  # Set mincut to 0.2 seconds, minclip to 0.1 seconds.
-  --smooth 0  # Turn off smoothing"""),
-  # TODO: Add `-s` for smoothing next major release.
+  -s 0.2s,0.1s  # Set mincut to 0.2 seconds, minclip to 0.1 seconds.
+  -s 0  # Turn off smoothing"""),
   OptDef(names: "-ex, --export", datum: "export",
     metavar: "EXPORT:ATTRS?", help: "Choose the export mode"),
   OptDef(names: "-exp, --export-to-premiere", kind: Special, datum: "premiere"),
