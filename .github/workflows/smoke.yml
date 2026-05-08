@@ -12,7 +12,7 @@ on:
       - '**about.nim'
       - '.github/workflows/build.yml'
     branches:
-      - master
+      - main
   pull_request:
     paths-ignore:
       - '**.md'
@@ -23,11 +23,22 @@ on:
       - '**about.nim'
       - '.github/workflows/build.yml'
     branches:
-      - master
-env:
-  AE_PRIVATE_LK: ${{ secrets.AE_PRIVATE_LK }}
+      - main
 jobs:
+  repo-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Conflict Marker Scan
+        run: |
+          if grep -R "<<<<<<<\|=======\|>>>>>>>" -n . --exclude-dir=.git --exclude-dir=ffmpeg_sources --exclude-dir=build; then echo "Found conflict markers"; /usr/bin/false; fi
+      - name: Check Ignored Artifacts
+        run: |
+          IGNORED=$(git ls-files -i -c --exclude-standard)
+          if [ -n "$IGNORED" ]; then echo "Found ignored artifacts checked in:"; echo "$IGNORED"; /usr/bin/false; fi
   fan:
+    needs: repo-checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -58,6 +69,8 @@ jobs:
   unixlike:
     needs: fan
     runs-on: ${{ matrix.os }}
+    env:
+      AE_PRIVATE_LK: ${{ secrets.AE_PRIVATE_LK }}
     strategy:
       fail-fast: false
       matrix:
@@ -148,6 +161,7 @@ jobs:
     runs-on: windows-latest
     env:
       DISABLE_HEVC: 1
+      AE_PRIVATE_LK: ${{ secrets.AE_PRIVATE_LK }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -205,6 +219,7 @@ jobs:
     runs-on: windows-11-arm
     env:
       DISABLE_HEVC: 1
+      AE_PRIVATE_LK: ${{ secrets.AE_PRIVATE_LK }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

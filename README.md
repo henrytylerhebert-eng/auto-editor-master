@@ -2,6 +2,8 @@
 
 **Auto-Editor** is a command line application for automatically **editing video and audio** by analyzing a variety of methods, most notably audio loudness.
 
+> **Note:** This fork tracks upstream; release authority remains upstream.
+
 ---
 
 [![Actions Status](https://img.shields.io/github/actions/workflow/status/wyattblue/auto-editor/build.yml?style=flat)](https://github.com/wyattblue/auto-editor/actions)
